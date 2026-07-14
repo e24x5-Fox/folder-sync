@@ -1,0 +1,53 @@
+name: Сборка и релиз .exe
+
+# Собираем автоматически при публикации тега вида v1.0.0, а также вручную
+# из вкладки Actions (workflow_dispatch) — удобно для проверки сборки без релиза.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write   # нужно, чтобы прикрепить .exe к GitHub Release
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Скачать код
+        uses: actions/checkout@v4
+
+      - name: Установить Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Установить зависимости
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Собрать FolderSync.exe
+        run: pyinstaller folder_sync.spec
+
+      - name: Проверить, что exe собрался
+        shell: bash
+        run: |
+          test -f dist/FolderSync.exe
+          ls -la dist
+
+      - name: Прикрепить exe как артефакт сборки
+        uses: actions/upload-artifact@v4
+        with:
+          name: FolderSync-windows-exe
+          path: dist/FolderSync.exe
+
+      - name: Опубликовать в GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/FolderSync.exe
+          body_path: RELEASE_NOTES.md
+          generate_release_notes: true
