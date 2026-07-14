@@ -46,6 +46,7 @@ import threading
 import uuid
 from pathlib import Path
 from functools import wraps
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from flask import (
     Flask, request, jsonify, render_template, session, redirect,
@@ -76,9 +77,11 @@ log_lock = threading.RLock()
 
 DEFAULT_STATE = {
     "routes": [],          # [{id, name, type, source, destination, enabled,
-                           #   interval, skip_unchanged}]  (interval/skip_unchanged: null = "как в общих")
+                           #   interval, skip_unchanged, threads}]
+                           # (interval/skip_unchanged/threads: null = "как в общих")
     "interval": 5,
     "skip_unchanged": True,
+    "threads": 2,          # общее число потоков копирования на правило по умолчанию
     "running": False,
 }
 
@@ -355,42 +358,108 @@ def effective_settings(route):
     with state_lock:
         g_interval = float(state.get("interval", 5))
         g_skip = bool(state.get("skip_unchanged", True))
+        g_threads = int(state.get("threads", 2) or 1)
     interval = route.get("interval")
     interval = g_interval if interval is None else float(interval)
     skip_unchanged = route.get("skip_unchanged")
     skip_unchanged = g_skip if skip_unchanged is None else bool(skip_unchanged)
-    return interval, skip_unchanged
+    threads = route.get("threads")
+    threads = g_threads if threads is None else int(threads)
+    threads = max(1, min(32, threads))
+    return interval, skip_unchanged, threads
+
+
+def _root_is_reachable(path):
+    """Проверяет, что диск/устройство, на котором лежит путь, вообще
+    подключено — чтобы не долбить каждые пару секунд отвалившееся
+    устройство (это и вызывает лишние всплывающие окна проводника/
+    автозапуска в Windows) и не сыпать одну и ту же ошибку на каждый файл."""
+    drive = os.path.splitdrive(os.path.abspath(path))[0]
+    if not drive:
+        return True
+    try:
+        return os.path.exists(drive + os.sep)
+    except OSError:
+        return False
 
 
 def process_route(route, stop_evt):
+    """Выполняет один проход синхронизации правила.
+    Возвращает True при успешном проходе (даже если часть файлов
+    пропущена/с ошибкой сети на конкретном файле) и False при
+    "жёсткой" ошибке уровня всего правила (источник/назначение
+    недоступны целиком) — это используется воркером для увеличения
+    паузы перед следующей попыткой (backoff), чтобы не долбить
+    отвалившееся устройство."""
     src = route["source"]
     dst = route["destination"]
     label = route.get("name") or src
-    interval, skip_unchanged = effective_settings(route)
+    interval, skip_unchanged, threads = effective_settings(route)
 
+    if not _root_is_reachable(src):
+        add_log(f"[{label}] диск/устройство источника недоступно: {src}", "error")
+        return False
     if not os.path.exists(src):
         add_log(f"[{label}] источник не найден: {src}", "error")
-        return
+        return False
+    if not _root_is_reachable(dst):
+        add_log(f"[{label}] диск/устройство назначения недоступно: {dst}", "error")
+        return False
 
     if os.path.isfile(src):
         dst_path = resolve_file_destination(src, dst)
-        copy_one_file(src, dst_path, interval, skip_unchanged, stop_evt)
-        return
+        status = copy_one_file(src, dst_path, interval, skip_unchanged, stop_evt)
+        return status != "error"
 
-    # источник — папка: копируем рекурсивно, сохраняя относительную структуру
-    for root, dirs, files in os.walk(src):
-        if stop_evt.is_set():
-            return
-        rel = os.path.relpath(root, src)
-        dst_dir = dst if rel == "." else os.path.join(dst, rel)
-        for fname in files:
+    # источник — папка: собираем список файлов, сохраняя относительную структуру
+    tasks = []
+    try:
+        for root, dirs, files in os.walk(src):
             if stop_evt.is_set():
-                return
-            copy_one_file(
-                os.path.join(root, fname),
-                os.path.join(dst_dir, fname),
-                interval, skip_unchanged, stop_evt,
-            )
+                return True
+            rel = os.path.relpath(root, src)
+            dst_dir = dst if rel == "." else os.path.join(dst, rel)
+            for fname in files:
+                tasks.append((os.path.join(root, fname), os.path.join(dst_dir, fname)))
+    except OSError as e:
+        add_log(f"[{label}] ошибка чтения источника: {e}", "error")
+        return False
+
+    if not tasks:
+        return True
+
+    error_count = 0
+
+    if threads <= 1 or len(tasks) <= 1:
+        for s_path, d_path in tasks:
+            if stop_evt.is_set():
+                return True
+            if copy_one_file(s_path, d_path, interval, skip_unchanged, stop_evt) == "error":
+                error_count += 1
+    else:
+        # несколько файлов этого правила копируются одновременно —
+        # количество потоков задаётся в настройках правила
+        with ThreadPoolExecutor(max_workers=threads, thread_name_prefix=f"copy-{route.get('id', '')}") as pool:
+            futures = {
+                pool.submit(copy_one_file, s_path, d_path, interval, skip_unchanged, stop_evt): (s_path, d_path)
+                for s_path, d_path in tasks
+            }
+            for fut in as_completed(futures):
+                if stop_evt.is_set():
+                    break
+                try:
+                    if fut.result() == "error":
+                        error_count += 1
+                except Exception as e:
+                    s_path, _ = futures[fut]
+                    add_log(f"[{label}] непредвиденная ошибка копирования {s_path}: {e}", "error")
+                    error_count += 1
+
+    # если ошибки почти на всех файлах — скорее всего, отвалилось само
+    # устройство/диск, а не отдельные файлы; сигналим воркеру об этом
+    if error_count and error_count >= len(tasks):
+        return False
+    return True
 
 
 # --------------------------------------------------------------------------
@@ -405,17 +474,40 @@ def _find_route(route_id):
     return None
 
 
+BASE_PAUSE = 2.0     # обычная пауза между проходами правила, сек
+MAX_BACKOFF_PAUSE = 60.0  # верхняя граница паузы при повторяющихся ошибках
+
+
 def route_worker_loop(route_id, stop_evt):
     add_log(f"[{route_id}] поток синхронизации запущен", "ok")
+    consecutive_failures = 0
     try:
         while not stop_evt.is_set():
             route = _find_route(route_id)
             if route is None or not route.get("enabled", True):
                 break
-            process_route(route, stop_evt)
+            ok = process_route(route, stop_evt)
+
+            if ok:
+                if consecutive_failures:
+                    add_log(f"[{route_id}] правило снова работает нормально", "ok")
+                consecutive_failures = 0
+                pause = BASE_PAUSE
+            else:
+                consecutive_failures += 1
+                # экспоненциальный backoff: 2 -> 4 -> 8 -> 16 -> 32 -> 60...
+                # чтобы не долбить отвалившийся диск/устройство каждые 2 сек
+                # (именно это и вызывало лишние всплывающие окна проводника)
+                pause = min(BASE_PAUSE * (2 ** consecutive_failures), MAX_BACKOFF_PAUSE)
+                if consecutive_failures == 1 or pause >= MAX_BACKOFF_PAUSE:
+                    add_log(
+                        f"[{route_id}] источник/назначение недоступны, "
+                        f"следующая попытка через {pause:g} с",
+                        "warn",
+                    )
 
             waited = 0.0
-            while waited < 2.0 and not stop_evt.is_set():
+            while waited < pause and not stop_evt.is_set():
                 time.sleep(0.2)
                 waited += 0.2
     finally:
@@ -481,6 +573,7 @@ def api_state():
             "routes": state["routes"],
             "interval": state["interval"],
             "skip_unchanged": state["skip_unchanged"],
+            "threads": state.get("threads", 2),
             "running": state.get("running", False) and any_worker_running(),
         })
 
@@ -586,6 +679,19 @@ def _parse_override_skip(data, out):
     out["skip_unchanged"] = None if val is None else bool(val)
 
 
+def _parse_override_threads(data, out):
+    if "threads" not in data:
+        return
+    val = data["threads"]
+    if val is None or val == "":
+        out["threads"] = None
+    else:
+        try:
+            out["threads"] = max(1, min(32, int(val)))
+        except (TypeError, ValueError):
+            pass
+
+
 @app.route("/api/routes", methods=["POST"])
 def api_add_route():
     data = request.get_json(force=True, silent=True) or {}
@@ -608,9 +714,11 @@ def api_add_route():
         "enabled": True,
         "interval": None,          # None = использовать общие настройки
         "skip_unchanged": None,    # None = использовать общие настройки
+        "threads": None,           # None = использовать общие настройки
     }
     _parse_override_interval(data, route)
     _parse_override_skip(data, route)
+    _parse_override_threads(data, route)
 
     with state_lock:
         state["routes"].append(route)
@@ -637,6 +745,7 @@ def api_edit_route(route_id):
                     r["type"] = "folder" if os.path.isdir(r["source"]) else "file"
                 _parse_override_interval(data, r)
                 _parse_override_skip(data, r)
+                _parse_override_threads(data, r)
                 save_state()
                 running = state.get("running", False)
                 result = dict(r)
@@ -678,8 +787,17 @@ def api_settings():
                 pass
         if "skip_unchanged" in data:
             state["skip_unchanged"] = bool(data["skip_unchanged"])
+        if "threads" in data:
+            try:
+                state["threads"] = max(1, min(32, int(data["threads"])))
+            except (TypeError, ValueError):
+                pass
         save_state()
-        return jsonify({"interval": state["interval"], "skip_unchanged": state["skip_unchanged"]})
+        return jsonify({
+            "interval": state["interval"],
+            "skip_unchanged": state["skip_unchanged"],
+            "threads": state.get("threads", 2),
+        })
 
 
 # --------------------------------------------------------------------------
