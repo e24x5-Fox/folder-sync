@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Конвейер копирования</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<div class="app">
+
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 40 40" width="34" height="34">
+          <circle cx="20" cy="20" r="18" fill="none" stroke="var(--accent)" stroke-width="2.4" stroke-dasharray="4 6"/>
+          <circle cx="20" cy="20" r="6" fill="var(--accent)"/>
+        </svg>
+      </div>
+      <div>
+        <h1>Конвейер копирования</h1>
+        <p class="subtitle">Файлы едут из источника в назначение только тогда, когда «улеглись»</p>
+      </div>
+    </div>
+
+    <div class="topbar-right">
+      <div class="status-pill" id="statusPill" data-state="stopped">
+        <span class="status-dot"></span>
+        <span id="statusText">Остановлено</span>
+      </div>
+      <button class="btn btn-primary" id="toggleRunBtn">Запустить</button>
+      <button class="icon-btn" id="logoutBtn" title="Выйти">⎋</button>
+    </div>
+  </header>
+
+  <main class="content">
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Правила копирования</h2>
+        <button class="btn btn-ghost" id="addRouteBtn">+ Добавить правило</button>
+      </div>
+
+      <div id="emptyState" class="empty-state" hidden>
+        <p>Правил пока нет.</p>
+        <p class="muted">Нажмите «Добавить правило» и выберите, что и куда копировать.</p>
+      </div>
+
+      <div id="routeList" class="route-list"></div>
+    </section>
+
+    <section class="panel settings-panel">
+      <div class="panel-head">
+        <h2>Настройки проверки (общие)</h2>
+      </div>
+      <div class="settings-row">
+        <label class="field">
+          <span>Интервал проверки стабильности, сек</span>
+          <input type="number" id="intervalInput" min="0" step="0.5" value="5">
+        </label>
+        <label class="checkbox-field">
+          <input type="checkbox" id="skipUnchangedInput" checked>
+          <span>Пропускать файлы, уже скопированные без изменений</span>
+        </label>
+      </div>
+      <p class="hint">Эти значения используются по умолчанию для всех правил. У каждого правила можно задать свои — в его настройках.</p>
+    </section>
+
+    <section class="panel security-panel">
+      <div class="panel-head">
+        <h2>Безопасность</h2>
+      </div>
+      <div class="settings-row">
+        <label class="field" style="flex:1;min-width:260px;">
+          <span>Ключ безопасности (нужен для доступа к этому серверу)</span>
+          <div class="path-input">
+            <input type="text" id="apiKeyInput" readonly value="••••••••••••••••">
+            <button class="btn btn-ghost btn-small" id="toggleKeyVisibility">Показать</button>
+            <button class="btn btn-ghost btn-small" id="copyKeyBtn">Копировать</button>
+          </div>
+        </label>
+        <button class="btn btn-ghost btn-small" id="regenerateKeyBtn">Пересоздать ключ</button>
+      </div>
+      <p class="hint">
+        Ключ хранится в файле <code>secret.json</code>. Он требуется в браузере один раз (сессия) либо
+        в заголовке <code>X-API-Key</code> при обращении к API с другого устройства. Никому не передавайте этот ключ.
+      </p>
+    </section>
+
+    <section class="panel log-panel">
+      <div class="panel-head">
+        <h2>Журнал</h2>
+        <button class="btn btn-ghost btn-small" id="clearLogBtn">Очистить</button>
+      </div>
+      <div class="terminal" id="terminal"></div>
+    </section>
+
+  </main>
+</div>
+
+<!-- Модалка добавления/редактирования правила -->
+<div class="modal-overlay" id="routeModalOverlay" hidden>
+  <div class="modal">
+    <div class="modal-head">
+      <h3 id="routeModalTitle">Новое правило</h3>
+      <button class="icon-btn" id="closeRouteModal" aria-label="Закрыть">✕</button>
+    </div>
+
+    <div class="modal-body">
+      <label class="field">
+        <span>Название (необязательно)</span>
+        <input type="text" id="routeNameInput" placeholder="Например: Фото с телефона">
+      </label>
+
+      <div class="path-row">
+        <label class="field">
+          <span>Источник (файл или папка)</span>
+          <div class="path-input">
+            <input type="text" id="sourceInput" placeholder="/путь/к/файлу-или-папке" readonly>
+            <button class="btn btn-ghost btn-small" data-browse-target="source">Обзор…</button>
+          </div>
+        </label>
+
+        <label class="field">
+          <span>Назначение (папка)</span>
+          <div class="path-input">
+            <input type="text" id="destinationInput" placeholder="/путь/куда/копировать" readonly>
+            <button class="btn btn-ghost btn-small" data-browse-target="destination">Обзор…</button>
+          </div>
+        </label>
+      </div>
+
+      <p class="hint" id="routeHint"></p>
+
+      <div class="route-custom-settings">
+        <label class="checkbox-field">
+          <input type="checkbox" id="routeCustomToggle">
+          <span>Свои настройки для этого правила (иначе — общие)</span>
+        </label>
+        <div class="settings-row" id="routeCustomFields" hidden>
+          <label class="field">
+            <span>Свой интервал проверки, сек</span>
+            <input type="number" id="routeIntervalInput" min="0" step="0.5" placeholder="как в общих">
+          </label>
+          <label class="field">
+            <span>Пропуск неизменных файлов</span>
+            <select id="routeSkipSelect">
+              <option value="default">как в общих настройках</option>
+              <option value="true">Да, пропускать</option>
+              <option value="false">Нет, копировать всегда</option>
+            </select>
+          </label>
+        </div>
+      </div>
+    </div>
+
+    <div class="modal-foot">
+      <button class="btn btn-ghost" id="cancelRouteBtn">Отмена</button>
+      <button class="btn btn-primary" id="saveRouteBtn">Сохранить</button>
+    </div>
+  </div>
+</div>
+
+<!-- Модалка обзора файловой системы -->
+<div class="modal-overlay" id="browseModalOverlay" hidden>
+  <div class="modal modal-browse">
+    <div class="modal-head">
+      <h3 id="browseModalTitle">Выбор пути</h3>
+      <button class="icon-btn" id="closeBrowseModal" aria-label="Закрыть">✕</button>
+    </div>
+
+    <div class="modal-body">
+      <div class="browse-toolbar">
+        <button class="icon-btn" id="browseUpBtn" title="Вверх">↑</button>
+        <button class="icon-btn" id="browseHomeBtn" title="Домашняя папка">⌂</button>
+        <input type="text" id="browsePathInput" class="browse-path-input" placeholder="Введите путь и нажмите Enter">
+      </div>
+
+      <div class="browse-list" id="browseList"></div>
+    </div>
+
+    <div class="modal-foot browse-foot">
+      <div class="browse-selected" id="browseSelectedLabel">Ничего не выбрано</div>
+      <div>
+        <button class="btn btn-ghost" id="chooseFolderBtn">Выбрать эту папку</button>
+        <button class="btn btn-primary" id="chooseItemBtn" disabled>Выбрать</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="/static/script.js"></script>
+</body>
+</html>
