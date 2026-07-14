@@ -28,6 +28,7 @@
     emptyState: document.getElementById("emptyState"),
     intervalInput: document.getElementById("intervalInput"),
     skipUnchangedInput: document.getElementById("skipUnchangedInput"),
+    threadsInput: document.getElementById("threadsInput"),
     terminal: document.getElementById("terminal"),
     clearLogBtn: document.getElementById("clearLogBtn"),
 
@@ -44,6 +45,7 @@
     routeCustomFields: document.getElementById("routeCustomFields"),
     routeIntervalInput: document.getElementById("routeIntervalInput"),
     routeSkipSelect: document.getElementById("routeSkipSelect"),
+    routeThreadsInput: document.getElementById("routeThreadsInput"),
 
     logoutBtn: document.getElementById("logoutBtn"),
     apiKeyInput: document.getElementById("apiKeyInput"),
@@ -105,6 +107,7 @@
     running = !!data.running;
     el.intervalInput.value = data.interval;
     el.skipUnchangedInput.checked = !!data.skip_unchanged;
+    el.threadsInput.value = data.threads || 2;
     renderRoutes();
     renderRunState();
   }
@@ -131,11 +134,17 @@
 
       const typeIcon = route.type === "folder" ? "📁" : "📄";
       const hasCustom = route.interval !== null && route.interval !== undefined
-        || route.skip_unchanged !== null && route.skip_unchanged !== undefined;
+        || route.skip_unchanged !== null && route.skip_unchanged !== undefined
+        || route.threads !== null && route.threads !== undefined;
       const customBadge = hasCustom ? ' <span class="badge-custom" title="У правила свои настройки">⚙</span>' : "";
+      const threadsLabel = (route.threads !== null && route.threads !== undefined)
+        ? `${route.threads} поток(ов)` : null;
+
+      const threadsBadge = threadsLabel
+        ? ` <span class="badge-custom" title="Потоков копирования: ${route.threads}">×${route.threads}</span>` : "";
 
       card.innerHTML = `
-        <div class="route-name" title="${escapeHtml(route.name)}">${typeIcon} ${escapeHtml(route.name)}${customBadge}</div>
+        <div class="route-name" title="${escapeHtml(route.name)}">${typeIcon} ${escapeHtml(route.name)}${customBadge}${threadsBadge}</div>
         <div class="path-chip" title="${escapeHtml(route.source)}">${escapeHtml(route.source)}</div>
         <div class="conveyor"><span class="dot"></span></div>
         <div></div>
@@ -191,12 +200,14 @@
 
     const hasInterval = route && route.interval !== null && route.interval !== undefined;
     const hasSkip = route && route.skip_unchanged !== null && route.skip_unchanged !== undefined;
-    const isCustom = hasInterval || hasSkip;
+    const hasThreads = route && route.threads !== null && route.threads !== undefined;
+    const isCustom = hasInterval || hasSkip || hasThreads;
 
     el.routeCustomToggle.checked = isCustom;
     el.routeCustomFields.hidden = !isCustom;
     el.routeIntervalInput.value = hasInterval ? route.interval : "";
     el.routeSkipSelect.value = hasSkip ? String(route.skip_unchanged) : "default";
+    el.routeThreadsInput.value = hasThreads ? route.threads : "";
 
     el.routeModalOverlay.hidden = false;
   }
@@ -234,9 +245,12 @@
       payload.interval = iv === "" ? null : parseFloat(iv);
       const sv = el.routeSkipSelect.value;
       payload.skip_unchanged = sv === "default" ? null : (sv === "true");
+      const tv = el.routeThreadsInput.value.trim();
+      payload.threads = tv === "" ? null : parseInt(tv, 10);
     } else {
       payload.interval = null;
       payload.skip_unchanged = null;
+      payload.threads = null;
     }
     try {
       let saved;
@@ -388,6 +402,7 @@
           body: JSON.stringify({
             interval: parseFloat(el.intervalInput.value) || 0,
             skip_unchanged: el.skipUnchangedInput.checked,
+            threads: parseInt(el.threadsInput.value, 10) || 1,
           }),
         });
       } catch (e) { /* тихо игнорируем */ }
@@ -395,6 +410,7 @@
   }
   el.intervalInput.addEventListener("input", scheduleSaveSettings);
   el.skipUnchangedInput.addEventListener("change", scheduleSaveSettings);
+  el.threadsInput.addEventListener("input", scheduleSaveSettings);
 
   // ---------------------------------------------------------------------
   // Старт / стоп
