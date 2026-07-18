@@ -234,6 +234,93 @@ body{
 
 .route-card.disabled{ opacity: 0.45; }
 
+.route-stats{
+  grid-column: 1 / -1;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-dim);
+  opacity: 0.75;
+}
+
+.route-progress{
+  grid-column: 1 / -1;
+  padding-top: 10px;
+  margin-top: 2px;
+  border-top: 1px solid var(--border);
+}
+
+.route-progress-head{
+  display:flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 6px;
+  font-size: 12px;
+}
+
+.route-progress-phase{
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.route-progress-speed{
+  font-family: var(--font-mono);
+  color: var(--text-dim);
+}
+
+.route-progress-bar{
+  height: 6px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.route-progress-bar-fill{
+  height: 100%;
+  width: 0%;
+  background: var(--ok);
+  border-radius: 999px;
+  transition: width 0.2s ease;
+}
+
+.route-progress-meta{
+  margin-top: 6px;
+  font-size: 11.5px;
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+}
+
+.route-progress-active{
+  margin-top: 6px;
+  display:flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.active-file{
+  display:flex;
+  justify-content: space-between;
+  gap: 10px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 8px;
+}
+
+.active-file-name{
+  overflow:hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+}
+
+.active-file-meta{
+  flex-shrink:0;
+  color: var(--text-dim);
+}
+
 .route-name{
   font-weight: 600;
   font-size: 13.5px;

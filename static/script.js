@@ -98,6 +98,40 @@
     return d.toLocaleTimeString("ru-RU", { hour12: false });
   }
 
+  function humanBytes(n) {
+    if (!n && n !== 0) return "0 Б";
+    const units = ["Б", "КБ", "МБ", "ГБ", "ТБ"];
+    let i = 0, v = n;
+    while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+    return (i === 0 ? v.toFixed(0) : v.toFixed(1)) + " " + units[i];
+  }
+
+  function humanSpeed(bps) {
+    return humanBytes(bps) + "/с";
+  }
+
+  function shortenPath(p, max) {
+    if (!p) return "";
+    if (p.length <= max) return p;
+    return "…" + p.slice(p.length - max + 1);
+  }
+
+  function pluralRu(n, one, few, many) {
+    const mod10 = Math.abs(n) % 10;
+    const mod100 = Math.abs(n) % 100;
+    if (mod100 > 10 && mod100 < 20) return many;
+    if (mod10 === 1) return one;
+    if (mod10 >= 2 && mod10 <= 4) return few;
+    return many;
+  }
+
+  function formatRouteStats(stats) {
+    const files = (stats && stats.files_copied) || 0;
+    const bytes = (stats && stats.bytes_copied) || 0;
+    const word = pluralRu(files, "файл", "файла", "файлов");
+    return `Скопировано за всё время: ${files} ${word}, ${humanBytes(bytes)}`;
+  }
+
   // ---------------------------------------------------------------------
   // Загрузка состояния
   // ---------------------------------------------------------------------
@@ -157,6 +191,16 @@
           <button class="icon-btn route-edit-btn" title="Редактировать">✎</button>
           <button class="icon-btn route-delete-btn" title="Удалить">🗑</button>
         </div>
+        <div class="route-progress" data-route-progress hidden>
+          <div class="route-progress-head">
+            <span class="route-progress-phase" data-progress-phase></span>
+            <span class="route-progress-speed" data-progress-speed></span>
+          </div>
+          <div class="route-progress-bar"><div class="route-progress-bar-fill" data-progress-bar></div></div>
+          <div class="route-progress-meta" data-progress-meta></div>
+          <div class="route-progress-active" data-progress-active></div>
+        </div>
+        <div class="route-stats" data-route-stats>${escapeHtml(formatRouteStats(route.stats))}</div>
       `;
 
       card.querySelector(".route-enabled-input").addEventListener("change", async (e) => {
@@ -491,6 +535,15 @@
     } catch (e) { /* сеть могла моргнуть — не страшно */ }
   }
 
+  function updateRouteStats(freshRoutes) {
+    (freshRoutes || []).forEach((fresh) => {
+      const idx = routes.findIndex((r) => r.id === fresh.id);
+      if (idx !== -1) routes[idx].stats = fresh.stats;
+      const statsEl = el.routeList.querySelector(`[data-route-id="${fresh.id}"] [data-route-stats]`);
+      if (statsEl) statsEl.textContent = formatRouteStats(fresh.stats);
+    });
+  }
+
   async function pollStatus() {
     try {
       const data = await api("/api/state");
@@ -498,6 +551,75 @@
         running = data.running;
         renderRunState();
       }
+      updateRouteStats(data.routes);
+    } catch (e) { /* игнор */ }
+  }
+
+  // ---------------------------------------------------------------------
+  // Прогресс копирования по каждому правилу (поллинг)
+  // ---------------------------------------------------------------------
+  function renderRouteProgress(routeId, p) {
+    const card = el.routeList.querySelector(`[data-route-id="${routeId}"]`);
+    if (!card || !p) return;
+
+    const box = card.querySelector("[data-route-progress]");
+    const activeEntries = Object.entries(p.active || {});
+    const queueLen = (p.queue || []).length;
+    const isBusy = p.phase === "scanning" || activeEntries.length > 0
+      || (p.pass_total_files || 0) > (p.pass_done_files || 0);
+
+    box.hidden = !isBusy;
+    if (!isBusy) return;
+
+    card.querySelector("[data-progress-phase]").textContent =
+      p.phase === "scanning" ? "Сканирую…" : "Копирую…";
+
+    const totalSpeed = activeEntries.reduce((sum, [, v]) => sum + (v.speed || 0), 0);
+    card.querySelector("[data-progress-speed]").textContent = totalSpeed ? humanSpeed(totalSpeed) : "";
+
+    const totalBytes = p.pass_total_bytes || 0;
+    const doneBytes = p.pass_done_bytes || 0;
+    const totalFiles = p.pass_total_files || 0;
+    const doneFiles = p.pass_done_files || 0;
+    const pct = totalBytes
+      ? Math.min(100, (doneBytes / totalBytes) * 100)
+      : (totalFiles ? (doneFiles / totalFiles) * 100 : 0);
+    card.querySelector("[data-progress-bar]").style.width = pct.toFixed(1) + "%";
+
+    const parts = [];
+    if (p.phase === "scanning") {
+      parts.push(`просканировано ${p.scanned_files || 0}`);
+    } else {
+      parts.push(`${doneFiles}/${totalFiles} файлов`);
+      if (totalBytes) parts.push(`${humanBytes(doneBytes)} / ${humanBytes(totalBytes)}`);
+    }
+    if (p.pass_skipped_files) parts.push(`уже актуально: ${p.pass_skipped_files}`);
+    if (queueLen) parts.push(`в очереди: ${queueLen}`);
+    card.querySelector("[data-progress-meta]").textContent = parts.join(" · ");
+
+    const activeBox = card.querySelector("[data-progress-active]");
+    activeBox.innerHTML = "";
+    activeEntries.slice(0, 3).forEach(([path, info]) => {
+      const row = document.createElement("div");
+      row.className = "active-file";
+      const meta = info.state === "waiting"
+        ? "жду стабильности…"
+        : `${humanBytes(info.done)} / ${humanBytes(info.size)} — ${humanSpeed(info.speed)}`;
+      row.innerHTML = `<span class="active-file-name" title="${escapeHtml(path)}">${escapeHtml(shortenPath(path, 60))}</span><span class="active-file-meta">${meta}</span>`;
+      activeBox.appendChild(row);
+    });
+    if (activeEntries.length > 3) {
+      const more = document.createElement("div");
+      more.className = "active-file-meta";
+      more.textContent = `…и ещё ${activeEntries.length - 3} копируется`;
+      activeBox.appendChild(more);
+    }
+  }
+
+  async function pollProgress() {
+    try {
+      const data = await api("/api/progress");
+      Object.keys(data).forEach((routeId) => renderRouteProgress(routeId, data[routeId]));
     } catch (e) { /* игнор */ }
   }
 
@@ -567,6 +689,8 @@
     }
     logPollTimer = setInterval(pollLogs, 1200);
     statusPollTimer = setInterval(pollStatus, 2500);
+    setInterval(pollProgress, 800);
     pollLogs();
+    pollProgress();
   })();
 })();

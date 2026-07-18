@@ -92,6 +92,108 @@ log_counter = 0
 workers = {}
 workers_lock = threading.RLock()
 
+CHUNK_SIZE = 4 * 1024 * 1024  # 4 МБ — размер порции для копирования с прогрессом
+
+# --------------------------------------------------------------------------
+# Прогресс синхронизации (для живого отображения в интерфейсе)
+# --------------------------------------------------------------------------
+# Правила синхронизируются параллельно (свой поток на каждое), а внутри
+# правила ещё и несколько файлов могут копироваться одновременно (threads).
+# Поэтому прогресс хранится НА ПРАВИЛО, а внутри — набор "active" копий,
+# идущих прямо сейчас (может быть больше одной, если threads > 1).
+
+progress_lock = threading.RLock()
+progress = {}  # route_id -> {...}
+
+
+def _route_progress(route_id):
+    return progress.setdefault(route_id, {
+        "phase": "idle",           # idle | scanning | copying
+        "scanned_files": 0,
+        "pass_total_files": 0,
+        "pass_total_bytes": 0,
+        "pass_done_files": 0,
+        "pass_done_bytes": 0,
+        "pass_skipped_files": 0,
+        "active": {},               # src_path -> {size, done, speed, state}
+        "queue": [],                 # предстоящие файлы этого прохода (превью)
+    })
+
+
+def reset_route_progress(route_id, phase="scanning"):
+    with progress_lock:
+        progress[route_id] = {
+            "phase": phase,
+            "scanned_files": 0,
+            "pass_total_files": 0,
+            "pass_total_bytes": 0,
+            "pass_done_files": 0,
+            "pass_done_bytes": 0,
+            "pass_skipped_files": 0,
+            "active": {},
+            "queue": [],
+        }
+
+
+def set_route_phase(route_id, phase):
+    with progress_lock:
+        _route_progress(route_id)["phase"] = phase
+
+
+def set_scanned(route_id, scanned):
+    with progress_lock:
+        _route_progress(route_id)["scanned_files"] = scanned
+
+
+def set_pass_totals(route_id, total_files, total_bytes, skipped, queue):
+    with progress_lock:
+        p = _route_progress(route_id)
+        p["phase"] = "copying" if total_files else "idle"
+        p["pass_total_files"] = total_files
+        p["pass_total_bytes"] = total_bytes
+        p["pass_skipped_files"] = skipped
+        p["queue"] = queue
+
+
+def mark_active(route_id, src_path, size):
+    with progress_lock:
+        p = _route_progress(route_id)
+        p["active"][src_path] = {"size": size, "done": 0, "speed": 0.0, "state": "waiting"}
+        p["queue"] = [q for q in p["queue"] if q["source"] != src_path]
+
+
+def set_active_state(route_id, src_path, state):
+    with progress_lock:
+        active = _route_progress(route_id)["active"]
+        if src_path in active:
+            active[src_path]["state"] = state
+
+
+def update_active_progress(route_id, src_path, done, speed):
+    with progress_lock:
+        active = _route_progress(route_id)["active"]
+        if src_path in active:
+            active[src_path]["done"] = done
+            active[src_path]["speed"] = speed
+
+
+def clear_active(route_id, src_path):
+    with progress_lock:
+        _route_progress(route_id)["active"].pop(src_path, None)
+
+
+def finish_task(route_id, result, size):
+    with progress_lock:
+        p = _route_progress(route_id)
+        p["pass_done_files"] += 1
+        if result == "copied":
+            p["pass_done_bytes"] += size
+
+
+def clear_route_progress(route_id):
+    with progress_lock:
+        progress.pop(route_id, None)
+
 
 # --------------------------------------------------------------------------
 # Безопасность: ключ доступа + сессии
@@ -242,6 +344,32 @@ def api_security_regenerate():
 # Состояние / персистентность
 # --------------------------------------------------------------------------
 
+def path_contains(parent, child):
+    """True, если child совпадает с parent или лежит внутри него."""
+    try:
+        parent_r = os.path.realpath(parent)
+        child_r = os.path.realpath(child)
+        if parent_r == child_r:
+            return True
+        return os.path.commonpath([parent_r, child_r]) == parent_r
+    except (ValueError, OSError):
+        return False
+
+
+def default_route_stats():
+    return {"files_copied": 0, "bytes_copied": 0}
+
+
+def ensure_route_stats(route):
+    stats = route.get("stats")
+    if not isinstance(stats, dict):
+        stats = default_route_stats()
+        route["stats"] = stats
+    stats.setdefault("files_copied", 0)
+    stats.setdefault("bytes_copied", 0)
+    return stats
+
+
 def load_state():
     if CONFIG_PATH.exists():
         try:
@@ -249,6 +377,8 @@ def load_state():
                 data = json.load(f)
             merged = json.loads(json.dumps(DEFAULT_STATE))
             merged.update(data)
+            for route in merged.get("routes", []):
+                ensure_route_stats(route)
             return merged
         except Exception:
             pass
@@ -328,22 +458,65 @@ def is_up_to_date(src_path, dst_path):
     return s_size == d_size and d_mtime >= s_mtime - 1
 
 
-def copy_one_file(src_path, dst_path, interval, skip_unchanged, stop_evt):
+def copy_one_file(src_path, dst_path, interval, skip_unchanged, stop_evt, route_id=None, size=0):
     if skip_unchanged and is_up_to_date(src_path, dst_path):
         return "skipped"
+
+    if route_id is not None:
+        mark_active(route_id, src_path, size)
     add_log(f"Проверяю: {src_path}")
     if not wait_until_stable(src_path, interval, stop_evt):
+        if route_id is not None:
+            clear_active(route_id, src_path)
         return "aborted"
+    if stop_evt.is_set():
+        if route_id is not None:
+            clear_active(route_id, src_path)
+        return "aborted"
+
     try:
         dst_dir = os.path.dirname(dst_path)
         if dst_dir:
             os.makedirs(dst_dir, exist_ok=True)
-        shutil.copy2(src_path, dst_path)
+
+        if route_id is not None:
+            set_active_state(route_id, src_path, "copying")
+
+        start = time.monotonic()
+        last_tick = start
+        last_done = 0
+        done = 0
+        with open(src_path, "rb") as fsrc, open(dst_path, "wb") as fdst:
+            while True:
+                if stop_evt.is_set():
+                    fdst.close()
+                    try:
+                        os.remove(dst_path)
+                    except OSError:
+                        pass
+                    if route_id is not None:
+                        clear_active(route_id, src_path)
+                    return "aborted"
+                chunk = fsrc.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+                fdst.write(chunk)
+                done += len(chunk)
+                now = time.monotonic()
+                dt = now - last_tick
+                if dt >= 0.2 and route_id is not None:
+                    update_active_progress(route_id, src_path, done, (done - last_done) / dt)
+                    last_tick = now
+                    last_done = done
+        shutil.copystat(src_path, dst_path)
         add_log(f"Скопировано → {dst_path}", "ok")
         return "copied"
     except Exception as e:
         add_log(f"Ошибка копирования {src_path}: {e}", "error")
         return "error"
+    finally:
+        if route_id is not None:
+            clear_active(route_id, src_path)
 
 
 def resolve_file_destination(src_file, dst):
@@ -369,6 +542,20 @@ def effective_settings(route):
     return interval, skip_unchanged, threads
 
 
+def record_route_stats(route_id, files_count, bytes_count):
+    """Накапливает статистику правила (сколько скопировано за всё время)
+    и сохраняет её в config.json. Вызывается один раз по итогам прохода,
+    а не на каждый файл — чтобы не долбить диск лишними записями."""
+    with state_lock:
+        for r in state["routes"]:
+            if r["id"] == route_id:
+                stats = ensure_route_stats(r)
+                stats["files_copied"] += files_count
+                stats["bytes_copied"] += bytes_count
+                break
+        save_state()
+
+
 def _root_is_reachable(path):
     """Проверяет, что диск/устройство, на котором лежит путь, вообще
     подключено — чтобы не долбить каждые пару секунд отвалившееся
@@ -391,69 +578,143 @@ def process_route(route, stop_evt):
     недоступны целиком) — это используется воркером для увеличения
     паузы перед следующей попыткой (backoff), чтобы не долбить
     отвалившееся устройство."""
+    route_id = route.get("id")
     src = route["source"]
     dst = route["destination"]
     label = route.get("name") or src
     interval, skip_unchanged, threads = effective_settings(route)
 
+    reset_route_progress(route_id, phase="scanning")
+
     if not _root_is_reachable(src):
         add_log(f"[{label}] диск/устройство источника недоступно: {src}", "error")
+        set_route_phase(route_id, "idle")
         return False
     if not os.path.exists(src):
         add_log(f"[{label}] источник не найден: {src}", "error")
+        set_route_phase(route_id, "idle")
         return False
     if not _root_is_reachable(dst):
         add_log(f"[{label}] диск/устройство назначения недоступно: {dst}", "error")
+        set_route_phase(route_id, "idle")
         return False
 
     if os.path.isfile(src):
+        try:
+            size = os.path.getsize(src)
+        except OSError:
+            size = 0
         dst_path = resolve_file_destination(src, dst)
-        status = copy_one_file(src, dst_path, interval, skip_unchanged, stop_evt)
+        if skip_unchanged and is_up_to_date(src, dst_path):
+            set_pass_totals(route_id, total_files=0, total_bytes=0, skipped=1, queue=[])
+            set_route_phase(route_id, "idle")
+            return True
+        set_pass_totals(route_id, total_files=1, total_bytes=size, skipped=0,
+                        queue=[{"source": src, "destination": dst_path, "size": size}])
+        status = copy_one_file(src, dst_path, interval, skip_unchanged, stop_evt, route_id, size)
+        finish_task(route_id, status, size)
+        if status == "copied":
+            record_route_stats(route_id, 1, size)
+        set_route_phase(route_id, "idle")
         return status != "error"
 
-    # источник — папка: собираем список файлов, сохраняя относительную структуру
+    # источник — папка: сканируем и решаем, что нужно скопировать, а что
+    # уже актуально (skip_unchanged) — заодно считаем общий объём для
+    # прогресс-бара и превью очереди
     tasks = []
+    skipped = 0
+    scanned = 0
+    last_tick = time.monotonic()
     try:
         for root, dirs, files in os.walk(src):
             if stop_evt.is_set():
+                set_route_phase(route_id, "idle")
                 return True
             rel = os.path.relpath(root, src)
             dst_dir = dst if rel == "." else os.path.join(dst, rel)
             for fname in files:
-                tasks.append((os.path.join(root, fname), os.path.join(dst_dir, fname)))
+                if stop_evt.is_set():
+                    set_route_phase(route_id, "idle")
+                    return True
+                s_path = os.path.join(root, fname)
+                d_path = os.path.join(dst_dir, fname)
+                if skip_unchanged and is_up_to_date(s_path, d_path):
+                    skipped += 1
+                else:
+                    try:
+                        size = os.path.getsize(s_path)
+                    except OSError:
+                        size = 0
+                    tasks.append((s_path, d_path, size))
+                scanned += 1
+                now = time.monotonic()
+                if now - last_tick > 0.2:
+                    set_scanned(route_id, scanned)
+                    last_tick = now
     except OSError as e:
         add_log(f"[{label}] ошибка чтения источника: {e}", "error")
+        set_route_phase(route_id, "idle")
         return False
 
+    total_bytes = sum(t[2] for t in tasks)
+    set_pass_totals(
+        route_id, total_files=len(tasks), total_bytes=total_bytes, skipped=skipped,
+        queue=[{"source": s, "destination": d, "size": sz} for s, d, sz in tasks],
+    )
+
     if not tasks:
+        if skipped:
+            add_log(f"[{label}] проход завершён: всё уже актуально ({skipped})", "ok")
+        set_route_phase(route_id, "idle")
         return True
 
     error_count = 0
+    copied_count = 0
+    copied_bytes = 0
 
     if threads <= 1 or len(tasks) <= 1:
-        for s_path, d_path in tasks:
+        for s_path, d_path, size in tasks:
             if stop_evt.is_set():
-                return True
-            if copy_one_file(s_path, d_path, interval, skip_unchanged, stop_evt) == "error":
+                break
+            result = copy_one_file(s_path, d_path, interval, skip_unchanged, stop_evt, route_id, size)
+            finish_task(route_id, result, size)
+            if result == "error":
                 error_count += 1
+            elif result == "copied":
+                copied_count += 1
+                copied_bytes += size
     else:
         # несколько файлов этого правила копируются одновременно —
         # количество потоков задаётся в настройках правила
-        with ThreadPoolExecutor(max_workers=threads, thread_name_prefix=f"copy-{route.get('id', '')}") as pool:
+        with ThreadPoolExecutor(max_workers=threads, thread_name_prefix=f"copy-{route_id}") as pool:
             futures = {
-                pool.submit(copy_one_file, s_path, d_path, interval, skip_unchanged, stop_evt): (s_path, d_path)
-                for s_path, d_path in tasks
+                pool.submit(copy_one_file, s_path, d_path, interval, skip_unchanged, stop_evt, route_id, size): (s_path, size)
+                for s_path, d_path, size in tasks
             }
             for fut in as_completed(futures):
-                if stop_evt.is_set():
-                    break
+                s_path, size = futures[fut]
                 try:
-                    if fut.result() == "error":
-                        error_count += 1
+                    result = fut.result()
                 except Exception as e:
-                    s_path, _ = futures[fut]
                     add_log(f"[{label}] непредвиденная ошибка копирования {s_path}: {e}", "error")
+                    result = "error"
+                finish_task(route_id, result, size)
+                if result == "error":
                     error_count += 1
+                elif result == "copied":
+                    copied_count += 1
+                    copied_bytes += size
+
+    if copied_count or skipped:
+        msg = f"[{label}] проход завершён: скопировано {copied_count}, уже актуально {skipped}"
+        if error_count:
+            msg += f", ошибок {error_count}"
+        add_log(msg, "warn" if error_count else "ok")
+
+    if copied_count:
+        record_route_stats(route_id, copied_count, copied_bytes)
+
+    set_route_phase(route_id, "idle")
 
     # если ошибки почти на всех файлах — скорее всего, отвалилось само
     # устройство/диск, а не отдельные файлы; сигналим воркеру об этом
@@ -511,6 +772,7 @@ def route_worker_loop(route_id, stop_evt):
                 time.sleep(0.2)
                 waited += 0.2
     finally:
+        clear_route_progress(route_id)
         add_log(f"[{route_id}] поток синхронизации остановлен", "warn")
 
 
@@ -585,6 +847,12 @@ def api_logs():
         new_logs = [l for l in log_buffer if l["i"] > since]
         last = log_counter
     return jsonify({"logs": new_logs, "last": last})
+
+
+@app.route("/api/progress")
+def api_progress():
+    with progress_lock:
+        return jsonify({rid: dict(p, active=dict(p["active"])) for rid, p in progress.items()})
 
 
 # --------------------------------------------------------------------------
@@ -703,6 +971,11 @@ def api_add_route():
         return jsonify({"error": "Укажите источник и назначение"}), 400
     if not os.path.exists(source):
         return jsonify({"error": "Указанный источник не найден на диске"}), 400
+    if os.path.isdir(source) and (path_contains(source, destination) or path_contains(destination, source)):
+        return jsonify({
+            "error": "Назначение не должно быть вложено в источник (и наоборот) — "
+                     "это вызовет бесконечное копирование папки саму в себя"
+        }), 400
 
     route_type = "folder" if os.path.isdir(source) else "file"
     route = {
@@ -715,6 +988,7 @@ def api_add_route():
         "interval": None,          # None = использовать общие настройки
         "skip_unchanged": None,    # None = использовать общие настройки
         "threads": None,           # None = использовать общие настройки
+        "stats": default_route_stats(),
     }
     _parse_override_interval(data, route)
     _parse_override_skip(data, route)
@@ -736,6 +1010,20 @@ def api_edit_route(route_id):
     with state_lock:
         for r in state["routes"]:
             if r["id"] == route_id:
+                new_source = data["source"].strip() if isinstance(data.get("source"), str) else r["source"]
+                new_destination = (
+                    data["destination"].strip() if isinstance(data.get("destination"), str) else r["destination"]
+                )
+                if "source" in data and not os.path.exists(new_source):
+                    return jsonify({"error": "Указанный источник не найден на диске"}), 400
+                if os.path.isdir(new_source) and (
+                    path_contains(new_source, new_destination) or path_contains(new_destination, new_source)
+                ):
+                    return jsonify({
+                        "error": "Назначение не должно быть вложено в источник (и наоборот) — "
+                                 "это вызовет бесконечное копирование папки саму в себя"
+                    }), 400
+
                 for field in ("source", "destination", "name"):
                     if field in data and data[field] is not None:
                         r[field] = data[field].strip()
@@ -766,6 +1054,7 @@ def api_delete_route(route_id):
         removed = before != len(state["routes"])
         running = state.get("running", False)
     if removed:
+        clear_route_progress(route_id)
         add_log("Правило удалено")
         if running:
             sync_workers_with_routes()
